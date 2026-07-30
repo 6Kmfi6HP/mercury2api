@@ -23,34 +23,57 @@ type sseEvent struct {
 // 按 SSE 到达顺序拼接即为完整 assistant 回答。
 // reasoning-* / text-start / text-end 等事件被忽略。
 // 遇到 [DONE] 结束扫描（但其后若有残留 delta 也忽略）。
+//
+// 全量解析（非流式 executor 与全量 streamTransform 用）；流式 executor 改用
+// parseDeltaFromLine 逐行增量解析，共享同一行级规则，避免两处分叉。
 func parseDeltas(raw string) []string {
 	var deltas []string
 	sc := bufio.NewScanner(strings.NewReader(raw))
 	// Inception 的 text-delta 可能较长，放大缓冲
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
-			continue
-		}
-		// SSE 行形如 "data: {json}" 或 "data: [DONE]"
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if payload == "" || payload == "[DONE]" {
-			continue
-		}
-		var ev sseEvent
-		if err := json.Unmarshal([]byte(payload), &ev); err != nil {
-			// 非 JSON 行（如注释/事件名）跳过
-			continue
-		}
-		if ev.Type == "text-delta" {
-			deltas = append(deltas, ev.Delta)
+		if delta, ok := parseDeltaFromLine(sc.Text()); ok {
+			deltas = append(deltas, delta)
 		}
 	}
 	return deltas
+}
+
+// parseDeltaFromLine 解析单行 SSE，命中一个 text-delta 事件时返回其 delta 字符串。
+// 规则与 parseDeltas 一致：跳过非 data: 行、空行、[DONE]；json 解析失败跳过；
+// 仅 type=="text-delta" 取 ev.Delta。这是流式 executor 逐行增量调用的入口，
+// 也被全量 parseDeltas 复用，确保两路径解析规则不分裂。
+func parseDeltaFromLine(line string) (string, bool) {
+	line = strings.TrimSpace(line)
+	if line == "" || !strings.HasPrefix(line, "data:") {
+		return "", false
+	}
+	payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+	if payload == "" || isDonePayload(payload) {
+		return "", false
+	}
+	var ev sseEvent
+	if err := json.Unmarshal([]byte(payload), &ev); err != nil {
+		return "", false
+	}
+	if ev.Type != "text-delta" {
+		return "", false
+	}
+	return ev.Delta, true
+}
+
+// isDoneLine 判断一行 SSE 是否为终止标记 [DONE]（data: [DONE] 或裸 [DONE]）。
+func isDoneLine(line string) bool {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "data:") {
+		return false
+	}
+	return isDonePayload(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+}
+
+// isDonePayload 判断 data: 之后的 payload 是否为 [DONE]。
+func isDonePayload(payload string) bool {
+	return payload == "[DONE]"
 }
 
 // parseFinished 判断 SSE 流是否包含 [DONE] 终止标记。

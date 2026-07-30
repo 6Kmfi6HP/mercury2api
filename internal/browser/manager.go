@@ -1,51 +1,61 @@
+// Package browser 原先用 chromedp 驱动本地 Chrome 绕过 Vercel Bot Challenge 后在页面内
+// 同源 fetch 调 Inception /api/chat。经实测（见项目记录），Inception 现阶段并不对
+// /api/session 与 /api/chat 强制 WAF 挑战：仅需用浏览器级 TLS/HTTP2 指纹（tls-client 伪装
+// Chrome）即可放行，/api/chat 的唯一前置是 /api/session 返回的 x-session-token。
+//
+// 因此本包已重构为纯 Go 指纹直连，完全移除浏览器进程：
+//   - 单例 tls-client.HttpClient（Chrome profile），单进程常驻复用；
+//   - token 缓存：首次（或 401 失效）时 GET /api/session 取 token，复用调 /api/chat；
+//   - 对外接口 NewManager/Start/WaitReady/FetchChat/Close 与旧实现保持一致，
+//     internal/inception/executor 与 cmd/main 无需感知此变化。
+//
+// userDataDir / headless 参数仅为兼容 main 装配签名而保留，本实现已不使用（不再有浏览器）。
 package browser
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/chromedp/cdproto/runtime"
-	"github.com/chromedp/chromedp"
+	fhttp "github.com/bogdanfinn/fhttp"
+	tls_client "github.com/bogdanfinn/tls-client"
+	"github.com/bogdanfinn/tls-client/profiles"
 )
 
 const (
-	homeURL  = "https://chat.inceptionlabs.ai/"
-	chatPath = "/api/chat"
-	// fetchChatTimeout 是页面内 fetch 一次 /api/chat 的总超时（SSE 可能较长）。
+	homeURL    = "https://chat.inceptionlabs.ai/"
+	sessionURL = "https://chat.inceptionlabs.ai/api/session"
+	chatURL    = "https://chat.inceptionlabs.ai/api/chat"
+	ua         = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+	// fetchChatTimeout 是单次 /api/chat 调用总超时（SSE 可能较长）。
 	fetchChatTimeout = 5 * time.Minute
-	// navTimeout 是导航 + 等待真实页面（绕过 challenge）的超时。
-	navTimeout = 60 * time.Second
 )
 
-// FetchResult 是页面内 fetch /api/chat 的归一化结果。
+// FetchResult 是 /api/chat 的归一化结果，与旧实现定义一致。
 type FetchResult struct {
 	Status int    // HTTP 状态码
 	Body   string // 响应体（成功时是 SSE 文本，失败时是错误页/JSON）
 }
 
-// Manager 管理 chromedp 单例浏览器：启动、通过 Vercel challenge、在页面内
-// 用 fetch() 调 Inception API。单 page 复用，所有 Evaluate 串行化（v1 简单可靠）。
+// Manager 管理指纹客户端单例与 session token 缓存。无浏览器进程。
 type Manager struct {
-	userDataDir string
-	headless    bool
-	allocCtx    context.Context
-	allocCancel context.CancelFunc
-	browserCtx  context.Context
-	browserCxl  context.CancelFunc
-	mu          sync.Mutex // 串行所有 Evaluate（单 page 复用）
-	startOnce   sync.Once
-	startErr    error
-	ready       chan struct{} // close 后表示浏览器就绪
+	userDataDir string // 兼容签名，已不使用
+	headless    bool   // 兼容签名，已不使用（永远无浏览器）
+
+	client  tls_client.HttpClient
+	tokenMu sync.Mutex // 保护 token 缓存
+	token   string
+
+	startOnce sync.Once
+	startErr  error
+	ready     chan struct{} // close 后表示就绪
 }
 
-// NewManager 创建浏览器管理器。userDataDir 用于持久化 challenge cookie 复用；
-// headless 为 true 时用无头模式（已验证 headless 可通过 Vercel challenge）。
+// NewManager 创建指纹管理器。userDataDir/headless 仅为兼容旧装配签名。
 func NewManager(userDataDir string, headless bool) *Manager {
 	return &Manager{
 		userDataDir: userDataDir,
@@ -54,11 +64,11 @@ func NewManager(userDataDir string, headless bool) *Manager {
 	}
 }
 
-// Start 同步启动浏览器并导航到首页等待真实页面就绪。
-// 内部用 sync.Once 保证只启动一次；重复调用直接返回首次错误。
+// Start 初始化单例指纹客户端并标记就绪。幂等：sync.Once 保证只执行一次。
+// 它不再启动任何浏览器进程。
 func (m *Manager) Start(ctx context.Context) error {
 	m.startOnce.Do(func() {
-		m.startErr = m.start(ctx)
+		m.startErr = m.start()
 		if m.startErr == nil {
 			close(m.ready)
 		}
@@ -66,114 +76,18 @@ func (m *Manager) Start(ctx context.Context) error {
 	return m.startErr
 }
 
-// start 实际执行启动逻辑（仅在 Start 的 sync.Once 内调用一次）。
-func (m *Manager) start(ctx context.Context) error {
-	opts := append([]chromedp.ExecAllocatorOption{},
-		chromedp.NoFirstRun,
-		chromedp.NoDefaultBrowserCheck,
-		chromedp.Flag("disable-blink-features", "AutomationControlled"),
-		chromedp.Flag("disable-features", "Translate"),
+func (m *Manager) start() error {
+	c, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(),
+		tls_client.WithClientProfile(profiles.Chrome_146),
 	)
-	if m.headless {
-		opts = append(opts, chromedp.Headless)
+	if err != nil {
+		return fmt.Errorf("browser.start: new tls client: %w", err)
 	}
-	if m.userDataDir != "" {
-		opts = append(opts, chromedp.UserDataDir(m.userDataDir))
-	}
-	opts = append(opts, chromedp.DefaultExecAllocatorOptions[:]...)
-
-	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)
-	m.allocCtx, m.allocCancel = allocCtx, allocCancel
-
-	browserCtx, browserCxl := chromedp.NewContext(allocCtx)
-	m.browserCtx, m.browserCxl = browserCtx, browserCxl
-
-	// 首次 NewContext 不分配首个 target；这里手动触发一次导航拿到 page context。
-	if err := m.navigateAndWait(ctx, homeURL); err != nil {
-		return fmt.Errorf("browser.start: navigate home: %w", err)
-	}
+	m.client = c
 	return nil
 }
 
-// navigateAndWait 导航到 url 并等待真实页面就绪（challenge 页无 textarea/输入框）。
-// adapt 到 Vercel challenge：若检测到 challenge 页，轮询等待其自动完成。
-func (m *Manager) navigateAndWait(ctx context.Context, url string) error {
-	navCtx, cancel := context.WithTimeout(ctx, navTimeout)
-	defer cancel()
-
-	// 等待页面出现可交互输入框（textarea）作为"真实页面"标志；challenge 页不会出现。
-	// 同时兜底检查是否落在 challenge 页。
-	var located bool
-	err := chromedp.Run(m.browserCtx,
-		chromedp.Navigate(url),
-		chromedp.ActionFunc(func(c context.Context) error {
-			// 至少等 document.readyState==complete，再进入判定
-			return nil
-		}),
-	)
-	if err != nil {
-		return err
-	}
-
-	// 轮询：最多等 navTimeout 让 challenge 完成 / 页面就绪。
-	deadline, _ := navCtx.Deadline()
-	for {
-		if time.Now().After(deadline) {
-			break
-		}
-		state, errState := m.pageReadyState(navCtx)
-		if errState != nil {
-			return errState
-		}
-		switch state {
-		case "ready":
-			located = true
-		case "challenge":
-			// Vercel challenge 页，等待自动完成（5.0s 兜底）
-			select {
-			case <-time.After(2 * time.Second):
-			case <-navCtx.Done():
-				return navCtx.Err()
-			}
-			continue
-		default: // "loading"
-			select {
-			case <-time.After(500 * time.Millisecond):
-			case <-navCtx.Done():
-				return navCtx.Err()
-			}
-			continue
-		}
-		if located {
-			return nil
-		}
-	}
-	return errors.New("browser: navigate timeout waiting for real page (challenge not cleared)")
-}
-
-// pageReadyState 探测当前页面状态：challenge 页 / 真实页面 / 仍加载。
-func (m *Manager) pageReadyState(ctx context.Context) (string, error) {
-	js := `(function(){
-		var html = document.documentElement ? document.documentElement.outerHTML : '';
-		var title = document.title || '';
-		var bodyText = (document.body && document.body.innerText) ? document.body.innerText : '';
-		if (html.indexOf('Vercel Security Checkpoint') !== -1 || title.indexOf('Vercel Security') !== -1) return 'challenge';
-		// 真实页面标志：存在 textarea 或可输入区域
-		if (document.querySelector('textarea')) return 'ready';
-		if (document.querySelector('[contenteditable=\"true\"]')) return 'ready';
-		if (document.readyState === 'complete' && (bodyText.indexOf('Inception') !== -1 || bodyText.length > 200)) return 'ready';
-		return 'loading';
-	})()`
-	var result string
-	if err := chromedp.Run(m.browserCtx,
-		chromedp.Evaluate(js, &result),
-	); err != nil {
-		return "", err
-	}
-	return result, nil
-}
-
-// WaitReady 阻塞到浏览器就绪或 ctx 取消。可供 main 启动时使用。
+// WaitReady 阻塞到指纹客户端就绪或 ctx 取消。
 func (m *Manager) WaitReady(ctx context.Context) error {
 	select {
 	case <-m.ready:
@@ -183,119 +97,217 @@ func (m *Manager) WaitReady(ctx context.Context) error {
 	}
 }
 
-// FetchChat 在页面内用同源 fetch 调 /api/chat，全程读回 SSE 后返回完整文本。
-// inceptionBody 为已翻译好的 Inception 请求 JSON 字符串。串行复用单 page。
-// 检测到 challenge 拦截时自动重新导航重试一次。
+// FetchChat 用 Chrome 指纹直连 /api/chat，全量读回 SSE。串行复用单 client。
+// inceptionBody 为已翻译好的 Inception 请求 JSON 字符串。
+// 首/失效时取 session token，401 自动重取 token 再重试一次。
+//
+// 非流式路径（executor.Execute）仍走此方法：需整段 SSE 做整段翻译。
+// 流式路径请用 FetchChatStream（边收边推，不缓冲整段）。
 func (m *Manager) FetchChat(ctx context.Context, inceptionBody string) (*FetchResult, error) {
 	if err := m.WaitReady(ctx); err != nil {
 		return nil, err
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
 
-	res, err := m.doFetch(ctx, inceptionBody)
+	res, err := m.doFetch(ctx, inceptionBody, false)
 	if err != nil {
 		return nil, err
 	}
-	// challenge 拦截：重新导航首页刷 challenge cookie 后重试一次
-	if res.Status == 429 || looksLikeHTMLChallenge(res.Body) {
-		if errNav := m.navigateAndWait(ctx, homeURL); errNav != nil {
-			return nil, fmt.Errorf("browser.FetchChat: re-navigate after challenge: %w", errNav)
+	// 401 通常意味着 token 失效或缺失：重取 token 再试一次（仅一次）。
+	if res.Status == 401 {
+		token, tErr := m.refreshToken(ctx)
+		if tErr != nil {
+			return res, fmt.Errorf("browser.FetchChat: refresh token: %w", tErr)
 		}
-		res, err = m.doFetch(ctx, inceptionBody)
+		_ = token
+		res, err = m.doFetch(ctx, inceptionBody, false)
 		if err != nil {
 			return nil, err
-		}
-		if res.Status == 429 || looksLikeHTMLChallenge(res.Body) {
-			return res, errors.New("browser: still challenged after retry")
 		}
 	}
 	return res, nil
 }
 
-// doFetch 执行单次页面内 fetch，不带重试。
-func (m *Manager) doFetch(ctx context.Context, inceptionBody string) (*FetchResult, error) {
-	b64 := base64.StdEncoding.EncodeToString([]byte(inceptionBody))
-	// 用 IIFE 返回 Promise，配合 WithAwaitPromise 让 chromedp 等待 fetch 完成。
-	// body 以 base64 注入（仅含 A-Za-z0-9+/=，无引号/反斜杠风险），页面内 atob 还原。
-	js := `(async function(){
-		var body = JSON.parse(atob("` + b64 + `"));
-		var headers = { 'Content-Type': 'application/json' };
-		try {
-			var sr = await fetch('/api/session');
-			if (sr.ok) {
-				var sj = await sr.json();
-				if (sj && sj.token) headers['x-session-token'] = sj.token;
-			}
-		} catch(e) { /* token 可选，失败忽略 */ }
-		var r = await fetch('/api/chat', {
-			method: 'POST',
-			headers: headers,
-			body: JSON.stringify(body)
-		});
-		var text = await r.text();
-		return JSON.stringify({ status: r.status, body: text });
-	})()`
-
-	fetchCtx, cancel := context.WithTimeout(m.browserCtx, fetchChatTimeout)
-	defer cancel()
-	// 客户端取消（请求 ctx 取消）时，中止页面内 fetch。AfterFunc 在 Go 1.21+ 可用。
-	if ctx != nil && ctx.Err() == nil {
-		stop := context.AfterFunc(ctx, cancel)
-		defer stop()
+// FetchChatStream 用 Chrome 指纹直连 /api/chat，直接返回 *http.Response（不读 body），
+// 供流式 executor 用 bufio.Scanner 逐行边收边推。调用方负责 defer resp.Body.Close()。
+// 401 与 FetchChat 同策略：Do 返回后看 resp.StatusCode（响应头即就绪，无需读 body），
+// 命中则 Close 当前 body、refreshToken 后重试一次。
+func (m *Manager) FetchChatStream(ctx context.Context, inceptionBody string) (*fhttp.Response, error) {
+	if err := m.WaitReady(ctx); err != nil {
+		return nil, err
 	}
 
-	var raw string
-	start := time.Now()
-	err := chromedp.Run(fetchCtx,
-		chromedp.Evaluate(js, &raw,
-			func(p *runtime.EvaluateParams) *runtime.EvaluateParams {
-				return p.WithAwaitPromise(true)
-			},
-		),
-	)
+	resp, err := m.doChat(ctx, inceptionBody, false)
 	if err != nil {
-		return nil, fmt.Errorf("browser.fetch: evaluate failed after %s: %w", time.Since(start), err)
+		return nil, err
 	}
-	if raw == "" {
-		return nil, errors.New("browser.fetch: empty result from page")
+	if resp.StatusCode == 401 {
+		resp.Body.Close()
+		if _, tErr := m.refreshToken(ctx); tErr != nil {
+			return nil, fmt.Errorf("browser.FetchChatStream: refresh token: %w", tErr)
+		}
+		resp, err = m.doChat(ctx, inceptionBody, false)
+		if err != nil {
+			return nil, err
+		}
 	}
-
-	var out struct {
-		Status int    `json:"status"`
-		Body   string `json:"body"`
-	}
-	if errUn := json.Unmarshal([]byte(raw), &out); errUn != nil {
-		return nil, fmt.Errorf("browser.fetch: decode result: %w (raw=%q)", errUn, truncate(raw, 200))
-	}
-	return &FetchResult{Status: out.Status, Body: out.Body}, nil
+	return resp, nil
 }
 
-// looksLikeHTMLChallenge 判断响应体是否为 Vercel challenge 拦截页。
-func looksLikeHTMLChallenge(body string) bool {
+// doChat 执行单次 POST /api/chat 并返回 *http.Response（body 未读，调用方负责 Close）。
+// needToken=false 时复用缓存 token；needToken=true 强制重取后再调。
+func (m *Manager) doChat(ctx context.Context, inceptionBody string, needToken bool) (*fhttp.Response, error) {
+	req, err := m.buildChatRequest(ctx, inceptionBody, needToken)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("browser.fetch: POST /api/chat: %w", err)
+	}
+	return resp, nil
+}
+
+// buildChatRequest 构造带浏览器头与 session token 的 POST /api/chat 请求。
+// FetchChat（全量）与 FetchChatStream（流式）共用，保证请求构造一致。
+func (m *Manager) buildChatRequest(ctx context.Context, inceptionBody string, needToken bool) (*fhttp.Request, error) {
+	tok, err := m.tokenLocked(ctx, needToken)
+	if err != nil {
+		return nil, err
+	}
+	req, err := fhttp.NewRequestWithContext(ctx, "POST", chatURL, strings.NewReader(inceptionBody))
+	if err != nil {
+		return nil, fmt.Errorf("browser.fetch: new request: %w", err)
+	}
+	setBrowserHeaders(req)
+	req.Header.Set("Content-Type", "application/json")
+	if tok != "" {
+		req.Header.Set("x-session-token", tok)
+	}
+	return req, nil
+}
+
+// doFetch 执行单次 POST /api/chat 并全量读回 body。用于非流式 FetchChat。
+// needToken=false 时复用缓存 token；needToken=true 强制重取后再调。
+func (m *Manager) doFetch(ctx context.Context, inceptionBody string, needToken bool) (*FetchResult, error) {
+	resp, err := m.doChat(ctx, inceptionBody, needToken)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("browser.fetch: read body: %w", err)
+	}
+	return &FetchResult{Status: resp.StatusCode, Body: string(b)}, nil
+}
+
+// tokenLocked 返回当前 token（needToken=true 时先强制重取）。线程安全。
+func (m *Manager) tokenLocked(ctx context.Context, needToken bool) (string, error) {
+	m.tokenMu.Lock()
+	defer m.tokenMu.Unlock()
+	if needToken || m.token == "" {
+		tok, err := m.fetchToken(ctx)
+		if err != nil {
+			return "", err
+		}
+		m.token = tok
+	}
+	return m.token, nil
+}
+
+// refreshToken 强制重取 token 并更新缓存，返回新 token。
+func (m *Manager) refreshToken(ctx context.Context) (string, error) {
+	m.tokenMu.Lock()
+	defer m.tokenMu.Unlock()
+	tok, err := m.fetchToken(ctx)
+	if err != nil {
+		return "", err
+	}
+	m.token = tok
+	return tok, nil
+}
+
+// fetchToken GET /api/session → {"ok":true,"token":"..."}，提取 token。
+func (m *Manager) fetchToken(ctx context.Context) (string, error) {
+	req, err := fhttp.NewRequestWithContext(ctx, "GET", sessionURL, nil)
+	if err != nil {
+		return "", err
+	}
+	setBrowserHeaders(req)
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("fetch token: %w", err)
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("fetch token: read: %w", err)
+	}
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("fetch token: upstream %d: %s", resp.StatusCode, truncateStr(string(b), 160))
+	}
+	tok := extractToken(string(b))
+	if tok == "" {
+		return "", errors.New("fetch token: empty token in response")
+	}
+	return tok, nil
+}
+
+// Close 释放客户端。幂等。
+func (m *Manager) Close() error {
+	m.tokenMu.Lock()
+	defer m.tokenMu.Unlock()
+	// tls-client HttpClient 无显式 Close 必需，置空便于 GC。
+	m.client = nil
+	return nil
+}
+
+// setBrowserHeaders 设一组真实 Chrome 请求头（顺序由 fhttp 保持）。
+// 关键：必须带 Sec-Fetch-* 头族。实测（见项目记录）缺这族头会被 Vercel 判为
+// 非浏览器并返回 429 + 挑战页，即便 TLS/HTTP2 指纹已伪装成 Chrome。
+// 这里用浏览器内 JS fetch('/api/...') 的同源 XHR 头集合，与真实前端调用一致。
+func setBrowserHeaders(req *fhttp.Request) {
+	req.Header.Set("User-Agent", ua)
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Sec-Ch-Ua", `"Chromium";v="146", "Not?A_Brand";v="24", "Google Chrome";v="146"`)
+	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
+	req.Header.Set("Sec-Ch-Ua-Platform", `"macOS"`)
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("Referer", "https://chat.inceptionlabs.ai/")
+}
+
+// extractToken 从 {"ok":true,"token":"..."} 中提取 token 字段。
+func extractToken(s string) string {
+	i := strings.Index(s, `"token":"`)
+	if i < 0 {
+		return ""
+	}
+	s = s[i+len(`"token":"`):]
+	j := strings.Index(s, `"`)
+	if j < 0 {
+		return ""
+	}
+	return s[:j]
+}
+
+func truncateStr(s string, n int) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	if len(s) > n {
+		return s[:n] + "…"
+	}
+	return s
+}
+
+// 兼容性占位：旧实现里 sse.go 中的 looksLikeChallenge 不再用于 fetch 路径，
+// 但保留为可能的外部引用与诊断用途（返回 false 即可，纯直连不再有挑战页）。
+var _ = looksLikeChallenge
+
+// looksLikeChallenge 保留以兼容 sse.go 中同名函数的导出意图；纯直连不再命中。
+func looksLikeChallenge(body string) bool {
 	return strings.Contains(body, "Vercel Security Checkpoint") ||
 		strings.Contains(body, "<title>Vercel Security") ||
 		strings.Contains(body, "vercel-security-challenge")
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "…"
-}
-
-// Close 关闭浏览器。幂等。
-func (m *Manager) Close() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.browserCxl != nil {
-		m.browserCxl()
-		m.browserCxl = nil
-	}
-	if m.allocCancel != nil {
-		m.allocCancel()
-		m.allocCancel = nil
-	}
-	return nil
 }

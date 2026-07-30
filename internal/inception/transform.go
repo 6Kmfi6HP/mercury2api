@@ -273,49 +273,81 @@ func nonStreamInceptionToOpenAI(ctx context.Context, model string, originalReq, 
 	return b
 }
 
-// streamInceptionToOpenAI 把 Inception 全量 SSE 翻译为多个 OpenAI
-// chat.completion.chunk 行。每个 text-delta 产一个 chunk；结束追加 [DONE]。
-// SDK handler 会以 "data: %s\n\n" 包裹每个 [][]byte 元素发往客户端。
-func streamInceptionToOpenAI(ctx context.Context, model string, originalReq, translatedReq, raw []byte, param *any) [][]byte {
-	deltas := parseDeltas(string(raw))
-	id := "chatcmpl-" + uuid.NewString()
-	created := nowUnix()
-	row := func(delta openAIDelta, finish *string) []byte {
-		c := openAIChunk{
-			ID:      id,
-			Object:  "chat.completion.chunk",
-			Created: created,
-			Model:   model,
-			Choices: []openAIChunkChoice{{Index: 0, Delta: delta, FinishReason: finish}},
-		}
-		b, err := json.Marshal(c)
-		if err != nil {
-			return nil
-		}
-		return b
+// openAIStreamChunker 负责把 Inception 逐行 text-delta 增量封装为 OpenAI
+// chat.completion.chunk JSON 字节。流式 executor 与全量 streamInceptionToOpenAI
+// 共用同一封装逻辑，保证流式/全量输出逐字节一致。
+//
+// 一个 chunker 实例对应一次流式响应：id 与 created 在整个流内恒定（符合 OpenAI 语义）。
+type openAIStreamChunker struct {
+	id      string
+	created int64
+	model   string
+}
+
+// newOpenAIStreamChunker 构造流式封装器，生成贯穿整流的 id 与 created。
+func newOpenAIStreamChunker(model string) *openAIStreamChunker {
+	return &openAIStreamChunker{
+		id:      "chatcmpl-" + uuid.NewString(),
+		created: nowUnix(),
+		model:   model,
 	}
+}
+
+// row 构造单个 chunk 字节。finish 传 nil 表示无 finish_reason。
+func (c *openAIStreamChunker) row(delta openAIDelta, finish *string) []byte {
+	ch := openAIChunk{
+		ID:      c.id,
+		Object:  "chat.completion.chunk",
+		Created: c.created,
+		Model:   c.model,
+		Choices: []openAIChunkChoice{{Index: 0, Delta: delta, FinishReason: finish}},
+	}
+	b, err := json.Marshal(ch)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// RoleChunk 返回流首帧（delta.role="assistant"），符合 OpenAI 流式惯例。
+func (c *openAIStreamChunker) RoleChunk() []byte {
+	return c.row(openAIDelta{Role: "assistant"}, nil)
+}
+
+// ContentChunk 返回一个 text-delta 对应的 content 帧。
+// delta 为空时返回 nil（由调用方跳过，避免发空 content 帧）。
+func (c *openAIStreamChunker) ContentChunk(delta string) []byte {
+	if delta == "" {
+		return nil
+	}
+	return c.row(openAIDelta{Content: delta}, nil)
+}
+
+// StopChunk 返回流收尾帧（空 delta + finish_reason=stop）。
+func (c *openAIStreamChunker) StopChunk() []byte {
+	stop := "stop"
+	return c.row(openAIDelta{}, &stop)
+}
+
+// streamInceptionToOpenAI 把 Inception 全量 SSE 翻译为多个 OpenAI
+// chat.completion.chunk 行。每个 text-delta 产一个 chunk；结束追加收尾帧。
+// SDK handler 会以 "data: %s\n\n" 包裹每个 [][]byte 元素发往客户端，
+// 并在流结束后自动追加 data: [DONE]（openai_handlers.go），这里不手动追加。
+func streamInceptionToOpenAI(ctx context.Context, model string, originalReq, translatedReq, raw []byte, param *any) [][]byte {
+	c := newOpenAIStreamChunker(model)
+	deltas := parseDeltas(string(raw))
 
 	chunks := make([][]byte, 0, len(deltas)+2)
-	// 首个 chunk 带 role，符合 OpenAI 流式惯例
-	role := openAIDelta{Role: "assistant"}
-	if first := row(role, nil); first != nil {
+	if first := c.RoleChunk(); first != nil {
 		chunks = append(chunks, first)
 	}
 	for _, d := range deltas {
-		if d == "" {
-			continue
-		}
-		b := row(openAIDelta{Content: d}, nil)
-		if b != nil {
+		if b := c.ContentChunk(d); b != nil {
 			chunks = append(chunks, b)
 		}
 	}
-	// 收尾 chunk：空 delta + finish_reason=stop
-	stop := "stop"
-	if b := row(openAIDelta{}, &stop); b != nil {
+	if b := c.StopChunk(); b != nil {
 		chunks = append(chunks, b)
 	}
-	// [DONE] 终止标记由 SDK handler 在流结束后自动追加（openai_handlers.go），
-	// 这里不再手动追加，否则会出现重复的 data: [DONE]。
 	return chunks
 }
