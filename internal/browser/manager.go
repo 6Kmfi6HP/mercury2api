@@ -100,6 +100,9 @@ func (m *Manager) WaitReady(ctx context.Context) error {
 // FetchChat 用 Chrome 指纹直连 /api/chat，全量读回 SSE。串行复用单 client。
 // inceptionBody 为已翻译好的 Inception 请求 JSON 字符串。
 // 首/失效时取 session token，401 自动重取 token 再重试一次。
+//
+// 非流式路径（executor.Execute）仍走此方法：需整段 SSE 做整段翻译。
+// 流式路径请用 FetchChatStream（边收边推，不缓冲整段）。
 func (m *Manager) FetchChat(ctx context.Context, inceptionBody string) (*FetchResult, error) {
 	if err := m.WaitReady(ctx); err != nil {
 		return nil, err
@@ -124,14 +127,53 @@ func (m *Manager) FetchChat(ctx context.Context, inceptionBody string) (*FetchRe
 	return res, nil
 }
 
-// doFetch 执行单次 POST /api/chat，不带 token 失效重试。
+// FetchChatStream 用 Chrome 指纹直连 /api/chat，直接返回 *http.Response（不读 body），
+// 供流式 executor 用 bufio.Scanner 逐行边收边推。调用方负责 defer resp.Body.Close()。
+// 401 与 FetchChat 同策略：Do 返回后看 resp.StatusCode（响应头即就绪，无需读 body），
+// 命中则 Close 当前 body、refreshToken 后重试一次。
+func (m *Manager) FetchChatStream(ctx context.Context, inceptionBody string) (*fhttp.Response, error) {
+	if err := m.WaitReady(ctx); err != nil {
+		return nil, err
+	}
+
+	resp, err := m.doChat(ctx, inceptionBody, false)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == 401 {
+		resp.Body.Close()
+		if _, tErr := m.refreshToken(ctx); tErr != nil {
+			return nil, fmt.Errorf("browser.FetchChatStream: refresh token: %w", tErr)
+		}
+		resp, err = m.doChat(ctx, inceptionBody, false)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return resp, nil
+}
+
+// doChat 执行单次 POST /api/chat 并返回 *http.Response（body 未读，调用方负责 Close）。
 // needToken=false 时复用缓存 token；needToken=true 强制重取后再调。
-func (m *Manager) doFetch(ctx context.Context, inceptionBody string, needToken bool) (*FetchResult, error) {
+func (m *Manager) doChat(ctx context.Context, inceptionBody string, needToken bool) (*fhttp.Response, error) {
+	req, err := m.buildChatRequest(ctx, inceptionBody, needToken)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("browser.fetch: POST /api/chat: %w", err)
+	}
+	return resp, nil
+}
+
+// buildChatRequest 构造带浏览器头与 session token 的 POST /api/chat 请求。
+// FetchChat（全量）与 FetchChatStream（流式）共用，保证请求构造一致。
+func (m *Manager) buildChatRequest(ctx context.Context, inceptionBody string, needToken bool) (*fhttp.Request, error) {
 	tok, err := m.tokenLocked(ctx, needToken)
 	if err != nil {
 		return nil, err
 	}
-
 	req, err := fhttp.NewRequestWithContext(ctx, "POST", chatURL, strings.NewReader(inceptionBody))
 	if err != nil {
 		return nil, fmt.Errorf("browser.fetch: new request: %w", err)
@@ -141,10 +183,15 @@ func (m *Manager) doFetch(ctx context.Context, inceptionBody string, needToken b
 	if tok != "" {
 		req.Header.Set("x-session-token", tok)
 	}
+	return req, nil
+}
 
-	resp, err := m.client.Do(req)
+// doFetch 执行单次 POST /api/chat 并全量读回 body。用于非流式 FetchChat。
+// needToken=false 时复用缓存 token；needToken=true 强制重取后再调。
+func (m *Manager) doFetch(ctx context.Context, inceptionBody string, needToken bool) (*FetchResult, error) {
+	resp, err := m.doChat(ctx, inceptionBody, needToken)
 	if err != nil {
-		return nil, fmt.Errorf("browser.fetch: POST /api/chat: %w", err)
+		return nil, err
 	}
 	defer resp.Body.Close()
 	b, err := io.ReadAll(resp.Body)

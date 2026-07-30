@@ -1,9 +1,11 @@
 package inception
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 
@@ -71,39 +73,92 @@ func (e InceptionExecutor) Execute(ctx context.Context, auth *coreauth.Auth, req
 	return clipexec.Response{Payload: out}, nil
 }
 
-// ExecuteStream 处理流式请求。v1 采用全量模式：浏览器内 drain 整段 SSE 后，
-// 调用 streamTransform 切成多个 OpenAI chunk 一次性推入 channel 并 close。
-// 架构预留真流式（后续可用 CDP Network/Fetch 域实时转发，无需改 translator 协议）。
+// ExecuteStream 处理流式请求，真流式：上游 SSE 逐行读，每命中一个 text-delta
+// 立刻封装成 OpenAI chunk 推入 channel，handler 逐帧 flush 给客户端，达到打字机效果。
+//
+// 数据流：OpenAI body → Inception body → FetchChatStream（流式响应体）→
+// bufio.Scanner 逐行 → parseDeltaFromLine → openAIStreamChunker.ContentChunk → channel。
+//
+// 错误两段语义（对齐 SDK handlers_stream.go）：
+//   - 首帧前失败（translate 失败、上游 4xx/5xx、token 取失败）：return error，
+//     SDK 走 errChan → handler 返回 JSON 错误。
+//   - 首帧后中途失败（上游断流、扫描错误）：StreamChunk{Err}，
+//     SDK 经 WriteTerminalError 写一条错误 SSE 帧。
+//
+// [DONE] 与收尾 stop 帧约定：executor 发 finish_reason=stop 收尾帧，[DONE] 终止标记
+// 由 SDK handler 在流结束后自动追加（openai_handlers.go WriteDone），不在此手动加。
 func (e InceptionExecutor) ExecuteStream(ctx context.Context, auth *coreauth.Auth, req clipexec.Request, opts clipexec.Options) (*clipexec.StreamResult, error) {
-	respFormat := clipexec.ResponseFormatOrSource(opts)
-
 	inceptionBody := sdktr.TranslateRequestByFormatName(sdktr.FormatOpenAI, FormatInception, req.Model, req.Payload, true)
 	if len(inceptionBody) == 0 {
 		return nil, requestScopedError{err: errors.New("inception: failed to translate request body"), code: http.StatusBadRequest}
 	}
 
-	res, err := e.Bm.FetchChat(ctx, string(inceptionBody))
+	resp, err := e.Bm.FetchChatStream(ctx, string(inceptionBody))
 	if err != nil {
 		return nil, mapBrowserError(err)
 	}
-	if res.Status >= 400 {
-		return nil, mapUpstreamStatus(res.Status, res.Body)
+
+	// 首帧前：上游 4xx/5xx → 读 body 一段用于错误信息，return error（JSON 错误，不进 SSE）。
+	if resp.StatusCode >= 400 {
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024))
+		resp.Body.Close()
+		return nil, mapUpstreamStatus(resp.StatusCode, string(bodyBytes))
 	}
 
-	var param any
-	chunks := sdktr.TranslateStreamByFormatName(
-		ctx, FormatInception, respFormat, req.Model,
-		opts.OriginalRequest, inceptionBody, []byte(res.Body), &param,
-	)
-
-	ch := make(chan clipexec.StreamChunk, len(chunks)+1)
+	// 成功：启 goroutine 增量推流。channel 由本 executor 自管 close 时机。
+	ch := make(chan clipexec.StreamChunk, 16)
 	go func() {
+		defer resp.Body.Close()
 		defer close(ch)
-		for _, c := range chunks {
+
+		chunker := newOpenAIStreamChunker(req.Model)
+		// send 推一帧，ctx 取消则放弃整流。
+		send := func(payload []byte) bool {
+			if payload == nil {
+				return true
+			}
 			select {
-			case ch <- clipexec.StreamChunk{Payload: c}:
+			case ch <- clipexec.StreamChunk{Payload: payload}:
+				return true
 			case <-ctx.Done():
+				return false
+			}
+		}
+
+		// role 首帧。
+		if !send(chunker.RoleChunk()) {
+			return
+		}
+
+		// 逐行读上游 SSE，4MB 上限与 parseDeltas 一致，防长 text-delta 截断。
+		sc := bufio.NewScanner(resp.Body)
+		sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+		stopped := false
+		for sc.Scan() {
+			line := sc.Text()
+			if isDoneLine(line) {
+				if !send(chunker.StopChunk()) {
+					return
+				}
+				stopped = true
+				break
+			}
+			if delta, ok := parseDeltaFromLine(line); ok {
+				if !send(chunker.ContentChunk(delta)) {
+					return
+				}
+			}
+		}
+		// 上游不发 [DONE] 时补收尾帧（兜底）。
+		if !stopped {
+			if !send(chunker.StopChunk()) {
 				return
+			}
+		}
+		if errScan := sc.Err(); errScan != nil {
+			select {
+			case ch <- clipexec.StreamChunk{Err: requestScopedError{err: fmt.Errorf("inception: stream read: %w", errScan), code: http.StatusBadGateway}}:
+			case <-ctx.Done():
 			}
 		}
 	}()
